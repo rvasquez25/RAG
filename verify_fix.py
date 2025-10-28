@@ -17,9 +17,9 @@ def check_schema_in_code():
         content = f.read()
         
     required_elements = [
-        'PRIMARY KEY (id, chunk_id)',
-        'SHARD KEY (id)',
-        'UNIQUE KEY (chunk_id, id)'
+        'CREATE ROWSTORE TABLE',
+        'PRIMARY KEY (chunk_id)',
+        'SHARD KEY (chunk_id)'
     ]
     
     all_present = True
@@ -79,10 +79,10 @@ def test_table_creation():
         
         print("\nVerifying schema components:")
         checks = [
-            ('Composite PRIMARY KEY', 'PRIMARY KEY (`id`,`chunk_id`)' in create_sql),
-            ('SHARD KEY on id', 'SHARD KEY (`id`)' in create_sql),
-            ('UNIQUE KEY includes id', 'UNIQUE KEY' in create_sql and '`chunk_id`' in create_sql and '`id`' in create_sql),
-            ('VECTOR column', 'VECTOR(' in create_sql)
+            ('ROWSTORE table type', 'ROWSTORE' in create_sql or 'rowstore' in create_sql.lower()),
+            ('PRIMARY KEY on chunk_id', 'PRIMARY KEY (`chunk_id`)' in create_sql),
+            ('SHARD KEY on chunk_id', 'SHARD KEY (`chunk_id`)' in create_sql),
+            ('VECTOR column', 'VECTOR(' in create_sql or 'vector(' in create_sql.lower())
         ]
         
         all_good = True
