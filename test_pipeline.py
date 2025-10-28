@@ -244,46 +244,97 @@ def benchmark_retrieval_speed(config: Dict[str, Any], num_queries: int = 10):
     """
     print("\n=== Benchmarking Retrieval Speed ===")
     try:
-        from rag_pipeline import BGEEmbedder, SingleStoreVectorDB
+        from rag_pipeline import BGEEmbedder, SingleStoreVectorDB, Document
         
         embedder = BGEEmbedder("BAAI/bge-m3")
         vector_db = SingleStoreVectorDB(**config)
         
-        # Check if we have any data
+        # Use a specific test table for benchmarking
+        table_name = "test_embeddings"
+        
+        # Check if test table exists with data
         conn = pymysql.connect(**config)
         cursor = conn.cursor()
-        cursor.execute("SHOW TABLES")
-        tables = cursor.fetchall()
         
-        if not tables:
-            print("⚠ No tables found. Ingest some documents first.")
-            cursor.close()
-            conn.close()
-            return
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        table_exists = cursor.fetchone() is not None
         
-        table_name = tables[0][0]
-        print(f"Using table: {table_name}")
+        if table_exists:
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cursor.fetchone()[0]
+        else:
+            count = 0
         
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-        count = cursor.fetchone()[0]
-        print(f"Documents in table: {count}")
+        # Create test data if needed
+        if count == 0:
+            print(f"Creating test data in table: {table_name}")
+            
+            # Create table
+            vector_db.create_table(table_name, embedder.embedding_dim)
+            
+            # Create diverse test documents for better benchmarking
+            test_docs = []
+            test_texts = [
+                "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
+                "Deep learning uses neural networks with multiple layers to process complex patterns.",
+                "Natural language processing helps computers understand and generate human language.",
+                "Computer vision allows machines to interpret and analyze visual information from images.",
+                "Reinforcement learning trains agents through reward-based feedback mechanisms.",
+                "Data preprocessing is crucial for cleaning and preparing datasets for analysis.",
+                "Feature engineering involves creating meaningful variables from raw data.",
+                "Model evaluation uses metrics like accuracy, precision, and recall to assess performance.",
+                "Hyperparameter tuning optimizes model configurations for better results.",
+                "Cross-validation helps prevent overfitting by testing on different data splits.",
+                "Ensemble methods combine multiple models to improve prediction accuracy.",
+                "Transfer learning leverages pre-trained models for new related tasks.",
+                "Attention mechanisms help models focus on relevant parts of input data.",
+                "Gradient descent is an optimization algorithm used to minimize loss functions.",
+                "Regularization techniques prevent models from memorizing training data.",
+                "Batch normalization stabilizes and accelerates neural network training.",
+                "Dropout randomly disables neurons during training to reduce overfitting.",
+                "Convolutional neural networks excel at processing grid-like data structures.",
+                "Recurrent neural networks process sequential data with temporal dependencies.",
+                "Transformers use self-attention mechanisms for parallel sequence processing."
+            ]
+            
+            for i, text in enumerate(test_texts):
+                doc = Document(
+                    content=text,
+                    source="benchmark_test.txt",
+                    page_num=1,
+                    chunk_id=f"benchmark_chunk_{i}",
+                    metadata={"benchmark": True, "index": i}
+                )
+                test_docs.append(doc)
+            
+            # Generate embeddings
+            print(f"  Generating embeddings for {len(test_docs)} test documents...")
+            texts = [doc.content for doc in test_docs]
+            embeddings = embedder.embed_batch(texts)
+            
+            # Store
+            print(f"  Storing test documents...")
+            vector_db.insert_embeddings(table_name, test_docs, embeddings)
+            print(f"✓ Created {len(test_docs)} test documents for benchmarking")
+            count = len(test_docs)
+        else:
+            print(f"Using existing table: {table_name}")
+            print(f"Documents in table: {count}")
+        
         cursor.close()
         conn.close()
         
-        if count == 0:
-            print("⚠ Table is empty. Ingest some documents first.")
-            return
-        
         # Benchmark queries
         test_queries = [
-            "What is the main topic?",
-            "Explain the methodology",
-            "What are the conclusions?",
-            "Describe the results",
-            "What are the limitations?"
-        ] * (num_queries // 5)
+            "What is machine learning?",
+            "Explain neural networks",
+            "How does deep learning work?",
+            "What is natural language processing?",
+            "Describe computer vision techniques"
+        ] * (num_queries // 5 + 1)
         
         times = []
+        print(f"\nRunning {num_queries} benchmark queries...")
         for i, query in enumerate(test_queries[:num_queries], 1):
             start = time.time()
             query_embedding = embedder.embed_text(query)
@@ -296,6 +347,8 @@ def benchmark_retrieval_speed(config: Dict[str, Any], num_queries: int = 10):
                 print(f"  Query: {query}")
                 print(f"  Time: {elapsed*1000:.1f}ms")
                 print(f"  Results: {len(results)}")
+                if results:
+                    print(f"  Top score: {results[0]['similarity_score']:.4f}")
         
         avg_time = sum(times) / len(times)
         min_time = min(times)
@@ -307,13 +360,19 @@ def benchmark_retrieval_speed(config: Dict[str, Any], num_queries: int = 10):
         print(f"  Max: {max_time*1000:.1f}ms")
         print(f"  Throughput: {1/avg_time:.1f} queries/second")
         
+        print(f"\n  Note: Test table '{table_name}' kept for future benchmarks")
+        print(f"  To cleanup: DROP TABLE {table_name};")
+        
     except Exception as e:
         print(f"✗ Benchmark failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def validate_retrieval_quality(config: Dict[str, Any]):
     """
     Validate retrieval quality with sample queries
+    Uses the test_embeddings table created by benchmark
     
     Args:
         config: Database configuration
@@ -322,35 +381,57 @@ def validate_retrieval_quality(config: Dict[str, Any]):
     try:
         from advanced_rag import create_production_pipeline
         
+        # Use the test embeddings table
+        table_name = "test_embeddings"
+        
+        # Check if test table exists
+        conn = pymysql.connect(**config)
+        cursor = conn.cursor()
+        cursor.execute("SHOW TABLES LIKE %s", (table_name,))
+        table_exists = cursor.fetchone() is not None
+        
+        if table_exists:
+            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+            count = cursor.fetchone()[0]
+        else:
+            count = 0
+        
+        cursor.close()
+        conn.close()
+        
+        if count == 0:
+            print(f"⚠ No test data available in '{table_name}' table.")
+            print("  Run the benchmark first to create test data.")
+            print("  Or ingest your own documents.")
+            return
+        
+        print(f"Using test table: {table_name} ({count} documents)")
+        
         pipeline = create_production_pipeline(
             config,
             use_reranker=True,
             use_hybrid=True
         )
         
-        # Check if we have data
-        conn = pymysql.connect(**config)
-        cursor = conn.cursor()
-        cursor.execute("SHOW TABLES")
-        tables = cursor.fetchall()
-        cursor.close()
-        conn.close()
+        # Override table name to use test table
+        pipeline.table_name = table_name
         
-        if not tables:
-            print("⚠ No data available. Ingest documents first.")
-            return
-        
-        # Test queries
+        # Test queries designed for the benchmark test data
         test_cases = [
             {
-                "query": "main topic",
-                "expected_min_score": 0.3,
-                "description": "Generic topic query"
+                "query": "machine learning",
+                "expected_min_score": 0.5,
+                "description": "Direct match query"
             },
             {
-                "query": "specific technical term that probably doesn't exist",
+                "query": "neural network training",
+                "expected_min_score": 0.4,
+                "description": "Related concept query"
+            },
+            {
+                "query": "quantum computing algorithms",
                 "expected_min_score": 0.0,
-                "description": "Query with no matches"
+                "description": "Unrelated query (should have low scores)"
             }
         ]
         
@@ -373,6 +454,9 @@ def validate_retrieval_quality(config: Dict[str, Any]):
                     print(f"  ✓ Score meets expectations (>= {test['expected_min_score']})")
                 else:
                     print(f"  ⚠ Score below expectations (< {test['expected_min_score']})")
+                
+                # Show top result content preview
+                print(f"  Top result: {results[0]['content'][:60]}...")
             else:
                 print(f"  No results found")
                 if test['expected_min_score'] == 0.0:
@@ -382,6 +466,8 @@ def validate_retrieval_quality(config: Dict[str, Any]):
         
     except Exception as e:
         print(f"✗ Quality validation failed: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 def run_all_tests(config: Dict[str, Any]):
