@@ -58,12 +58,14 @@ USE rag_db;
 SELECT @@version;
 ```
 
-The pipeline will automatically create the required table with the following schema:
+### 3. Table Schema (Optimized for SingleStore 8.9+)
+
+The pipeline automatically creates an optimized table schema. The table uses a composite key design to comply with SingleStore 8.9's sharding requirements:
 
 ```sql
 CREATE TABLE document_embeddings (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    chunk_id VARCHAR(255) UNIQUE NOT NULL,
+    id BIGINT AUTO_INCREMENT,
+    chunk_id VARCHAR(255) NOT NULL,
     content TEXT NOT NULL,
     source VARCHAR(512) NOT NULL,
     page_num INT,
@@ -71,10 +73,16 @@ CREATE TABLE document_embeddings (
     metadata JSON,
     embedding VECTOR(1024) NOT NULL,  -- BGE-M3 dimension
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id, chunk_id),
+    SHARD KEY (id),
+    UNIQUE KEY (chunk_id, id),
     KEY (source),
-    KEY (page_num)
+    KEY (page_num),
+    KEY (source, page_num)
 );
 ```
+
+**Note:** For detailed explanation of the schema design and SingleStore 8.9 compatibility, see [SINGLESTORE_COMPATIBILITY.md](SINGLESTORE_COMPATIBILITY.md).
 
 ## Configuration
 
