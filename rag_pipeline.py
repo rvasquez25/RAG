@@ -310,11 +310,10 @@ class SingleStoreVectorDB:
             # Drop existing table if needed
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
             
-            # Create table optimized for SingleStore 8.9+
-            # Using id as shard key and chunk_id as unique key that includes id
+            # Create ROWSTORE table (not columnstore) to support unique constraints
+            # SingleStore columnstore tables have limitations on multiple unique indexes
             create_table_sql = f"""
-            CREATE TABLE {table_name} (
-                id BIGINT AUTO_INCREMENT,
+            CREATE ROWSTORE TABLE {table_name} (
                 chunk_id VARCHAR(255) NOT NULL,
                 content TEXT NOT NULL,
                 source VARCHAR(512) NOT NULL,
@@ -323,9 +322,8 @@ class SingleStoreVectorDB:
                 metadata JSON,
                 embedding VECTOR({embedding_dim}) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (id, chunk_id),
-                SHARD KEY (id),
-                UNIQUE KEY (chunk_id, id),
+                PRIMARY KEY (chunk_id),
+                SHARD KEY (chunk_id),
                 KEY (source),
                 KEY (page_num),
                 KEY (source, page_num)
@@ -333,8 +331,8 @@ class SingleStoreVectorDB:
             """
             cursor.execute(create_table_sql)
             conn.commit()
-            logger.info(f"Created table {table_name} with {embedding_dim}-dim vectors")
-            logger.info(f"Table uses composite primary key (id, chunk_id) with shard key on id")
+            logger.info(f"Created ROWSTORE table {table_name} with {embedding_dim}-dim vectors")
+            logger.info(f"Using chunk_id as primary and shard key")
             
         except Exception as e:
             logger.error(f"Error creating table: {e}")
