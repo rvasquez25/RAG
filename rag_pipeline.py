@@ -297,7 +297,7 @@ class SingleStoreVectorDB:
     
     def create_table(self, table_name: str, embedding_dim: int):
         """
-        Create a table for storing embeddings
+        Create a table for storing embeddings (SingleStore 8.9+ compatible)
         
         Args:
             table_name: Name of the table
@@ -310,11 +310,12 @@ class SingleStoreVectorDB:
             # Drop existing table if needed
             cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
             
-            # Create table with vector column
+            # Create table optimized for SingleStore 8.9+
+            # Using id as shard key and chunk_id as unique key that includes id
             create_table_sql = f"""
             CREATE TABLE {table_name} (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                chunk_id VARCHAR(255) UNIQUE NOT NULL,
+                id BIGINT AUTO_INCREMENT,
+                chunk_id VARCHAR(255) NOT NULL,
                 content TEXT NOT NULL,
                 source VARCHAR(512) NOT NULL,
                 page_num INT,
@@ -322,13 +323,18 @@ class SingleStoreVectorDB:
                 metadata JSON,
                 embedding VECTOR({embedding_dim}) NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (id, chunk_id),
+                SHARD KEY (id),
+                UNIQUE KEY (chunk_id, id),
                 KEY (source),
-                KEY (page_num)
+                KEY (page_num),
+                KEY (source, page_num)
             )
             """
             cursor.execute(create_table_sql)
             conn.commit()
             logger.info(f"Created table {table_name} with {embedding_dim}-dim vectors")
+            logger.info(f"Table uses composite primary key (id, chunk_id) with shard key on id")
             
         except Exception as e:
             logger.error(f"Error creating table: {e}")
@@ -362,6 +368,10 @@ class SingleStoreVectorDB:
             VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
             content = VALUES(content),
+            source = VALUES(source),
+            page_num = VALUES(page_num),
+            chunk_index = VALUES(chunk_index),
+            metadata = VALUES(metadata),
             embedding = VALUES(embedding)
             """
             
