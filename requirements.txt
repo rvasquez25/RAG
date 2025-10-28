@@ -1,0 +1,19 @@
+# Core dependencies for RAG pipeline
+sentence-transformers>=2.2.2
+pymysql>=1.1.0
+PyPDF2>=3.0.0
+numpy>=1.24.0
+
+# Optional: Enhanced PDF extraction
+pdfplumber>=0.10.0
+pytesseract>=0.3.10  # For OCR if needed
+
+# Optional: Better text processing
+nltk>=3.8
+spacy>=3.7.0
+
+# Optional: Progress tracking
+tqdm>=4.66.0
+
+# Optional: Configuration management
+python-dotenv>=1.0.0
