@@ -46,7 +46,7 @@ class DocumentProcessor:
         self.table_name = table_name
         self.auto_cleanup = auto_cleanup
         
-        print(f"✓ DocumentProcessor initialized")
+        print(f"âœ“ DocumentProcessor initialized")
         print(f"  Table: {table_name}")
         print(f"  S3 enabled: {s3_manager is not None}")
         print(f"  Auto cleanup: {auto_cleanup}")
@@ -90,47 +90,16 @@ class DocumentProcessor:
             if not documents:
                 raise ValueError("No text could be extracted from PDF")
             
-            print(f"  ✓ Extracted {len(documents)} pages")
+            print(f"  âœ“ Extracted {len(documents)} pages")
             
             # Step 2: Chunk documents
             print(f"[2/6] Chunking document...")
             chunked_docs = ChunkingStrategy.chunk_documents(documents)
-            print(f"  ✓ Created {len(chunked_docs)} chunks")
+            print(f"  âœ“ Created {len(chunked_docs)} chunks")
             
-            # Step 3: Enrich metadata
-            print(f"[3/6] Enriching metadata...")
-            file_metadata = self._create_file_metadata(
-                file_path,
-                filename,
-                len(documents),
-                len(chunked_docs),
-                metadata
-            )
-            
-            # Add metadata to all chunks
-            for chunk in chunked_docs:
-                chunk.metadata = {**chunk.metadata, **file_metadata}
-            
-            print(f"  ✓ Metadata added to {len(chunked_docs)} chunks")
-            
-            # Step 4: Generate embeddings
-            print(f"[4/6] Generating embeddings...")
-            texts = [doc.content for doc in chunked_docs]
-            embeddings = self.rag_pipeline.embedder.embed_batch(texts)
-            print(f"  ✓ Generated {len(embeddings)} embeddings")
-            
-            # Step 5: Store in database
-            print(f"[5/6] Storing in database...")
-            self.rag_pipeline.vector_db.insert_embeddings(
-                self.table_name,
-                chunked_docs,
-                embeddings
-            )
-            print(f"  ✓ Stored {len(chunked_docs)} chunks in {self.table_name}")
-            
-            # Step 6: Optional S3 upload
+            # Step 3: Upload to S3 FIRST (so we can include S3 info in metadata)
             if upload_to_s3 and self.s3_manager:
-                print(f"[6/6] Uploading to S3...")
+                print(f"[3/6] Uploading to S3...")
                 s3_key, s3_uri = self._upload_to_s3(
                     file_path,
                     filename,
@@ -138,7 +107,44 @@ class DocumentProcessor:
                 )
                 print(f"  ✓ Uploaded to S3: {s3_uri}")
             else:
-                print(f"[6/6] Skipping S3 upload")
+                print(f"[3/6] Skipping S3 upload")
+                s3_key = None
+                s3_uri = None
+            
+            # Step 4: Enrich metadata (including S3 info)
+            print(f"[4/6] Enriching metadata...")
+            file_metadata = self._create_file_metadata(
+                file_path,
+                filename,
+                len(documents),
+                len(chunked_docs),
+                metadata,
+                s3_key=s3_key,
+                s3_uri=s3_uri
+            )
+            
+            # Add metadata to all chunks
+            for chunk in chunked_docs:
+                chunk.metadata = {**chunk.metadata, **file_metadata}
+            
+            print(f"  ✓ Metadata added to {len(chunked_docs)} chunks")
+            if s3_uri:
+                print(f"    Including S3 location: {s3_uri}")
+            
+            # Step 5: Generate embeddings
+            print(f"[5/6] Generating embeddings...")
+            texts = [doc.content for doc in chunked_docs]
+            embeddings = self.rag_pipeline.embedder.embed_batch(texts)
+            print(f"  ✓ Generated {len(embeddings)} embeddings")
+            
+            # Step 6: Store in database (with S3 metadata already included)
+            print(f"[6/6] Storing in database...")
+            self.rag_pipeline.vector_db.insert_embeddings(
+                self.table_name,
+                chunked_docs,
+                embeddings
+            )
+            print(f"  ✓ Stored {len(chunked_docs)} chunks in {self.table_name}")
             
             # Cleanup local file
             if self.auto_cleanup:
@@ -156,14 +162,14 @@ class DocumentProcessor:
                 'processing_time': None  # Can be added if timing is tracked
             }
             
-            print(f"\n✓ Successfully processed {filename}")
+            print(f"\nâœ“ Successfully processed {filename}")
             print(f"  Pages: {result['pages']}, Chunks: {result['chunks']}")
             
             return result
             
         except Exception as e:
             error_msg = str(e)
-            print(f"\n✗ Failed to process {filename}: {error_msg}")
+            print(f"\nâœ— Failed to process {filename}: {error_msg}")
             traceback.print_exc()
             
             # Cleanup on error
@@ -178,7 +184,9 @@ class DocumentProcessor:
         filename: str,
         total_pages: int,
         total_chunks: int,
-        user_metadata: Dict[str, Any]
+        user_metadata: Dict[str, Any],
+        s3_key: Optional[str] = None,
+        s3_uri: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create comprehensive metadata for the document
@@ -201,6 +209,8 @@ class DocumentProcessor:
             "total_chunks": total_chunks,
             "file_size_kb": file_path.stat().st_size // 1024 if file_path.exists() else 0,
             "ingestion_date": datetime.now().isoformat(),
+            "s3_key": s3_key,
+            "s3_uri": s3_uri,
             **user_metadata
         }
         
@@ -265,13 +275,63 @@ class DocumentProcessor:
         try:
             if file_path.exists():
                 file_path.unlink()
-                print(f"  ✓ Deleted local file: {file_path.name}")
+                print(f"  âœ“ Deleted local file: {file_path.name}")
                 return True
             return False
         except Exception as e:
-            print(f"  ⚠️  Failed to delete local file {file_path}: {e}")
+            print(f"  âš ï¸  Failed to delete local file {file_path}: {e}")
             return False
     
+    
+    def _update_chunks_with_s3_metadata(
+        self,
+        source_filename: str,
+        s3_key: str,
+        s3_uri: str
+    ) -> int:
+        """
+        Update all chunks for a document with S3 information
+        
+        Args:
+            source_filename: Original filename (source field in database)
+            s3_key: S3 object key
+            s3_uri: Full S3 URI
+            
+        Returns:
+            Number of chunks updated
+        """
+        import pymysql
+        import json
+        
+        conn = pymysql.connect(**self.rag_pipeline.vector_db.connection_params)
+        cursor = conn.cursor()
+        
+        try:
+            # Update all chunks from this source with S3 info
+            update_sql = f"""
+            UPDATE {self.table_name}
+            SET metadata = JSON_SET(
+                metadata,
+                '$.s3_key', %s,
+                '$.s3_uri', %s
+            )
+            WHERE source = %s
+            """
+            
+            cursor.execute(update_sql, (s3_key, s3_uri, source_filename))
+            updated_count = cursor.rowcount
+            
+            conn.commit()
+            return updated_count
+            
+        except Exception as e:
+            print(f"  ⚠️  Failed to update chunks with S3 metadata: {e}")
+            conn.rollback()
+            return 0
+        finally:
+            cursor.close()
+            conn.close()
+
     def process_batch(
         self,
         file_paths: list[tuple[Path, str]],
@@ -326,7 +386,7 @@ class DocumentProcessor:
                 results['files'].append(error_result)
                 results['failed'] += 1
                 
-                print(f"  ✗ Failed: {e}")
+                print(f"  âœ— Failed: {e}")
         
         # Print summary
         print(f"\n{'='*60}")
@@ -507,5 +567,5 @@ if __name__ == "__main__":
         auto_cleanup=False  # Don't delete for testing
     )
     
-    print("\n✓ DocumentProcessor ready")
+    print("\nâœ“ DocumentProcessor ready")
     print("  Use processor.process_document() to ingest PDFs")
