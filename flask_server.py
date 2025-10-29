@@ -1165,9 +1165,8 @@ def download_document(source: str):
 # Initialize and Run
 # ============================================
 
-@app.before_first_request
 def initialize():
-    """Initialize on first request"""
+    """Initialize RAG pipeline and S3"""
     try:
         # Initialize pipeline
         rag = get_pipeline()
@@ -1199,6 +1198,11 @@ if __name__ == "__main__":
     if S3_CONFIG['enabled']:
         print(f"S3 Bucket: {S3_CONFIG['bucket']}")
     print("=" * 60)
+    print()
+    
+    # Initialize before starting server
+    print("Initializing...")
+    initialize()
     print()
     
     # Run Flask app
