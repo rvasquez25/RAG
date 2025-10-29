@@ -33,7 +33,8 @@ class S3Manager:
         bucket: str,
         region: str = 'us-east-1',
         access_key: Optional[str] = None,
-        secret_key: Optional[str] = None
+        secret_key: Optional[str] = None,
+        endpoint_url: Optional[str] = None
     ):
         """
         Initialize S3 client
@@ -43,31 +44,38 @@ class S3Manager:
             region: AWS region (default: us-east-1)
             access_key: AWS access key (uses env var if None)
             secret_key: AWS secret key (uses env var if None)
+            endpoint_url: Custom S3 endpoint for S3-compatible storage (MinIO, DigitalOcean Spaces, etc.)
         """
         if not S3_AVAILABLE:
             raise ImportError("boto3 not installed. Install with: pip install boto3")
         
         self.bucket = bucket
         self.region = region
+        self.endpoint_url = endpoint_url
         
         # Initialize S3 client
-        self.s3_client = boto3.client(
-            's3',
-            region_name=region,
-            aws_access_key_id=access_key or os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=secret_key or os.getenv('AWS_SECRET_ACCESS_KEY')
-        )
+        client_config = {
+            'region_name': region,
+            'aws_access_key_id': access_key or os.getenv('AWS_ACCESS_KEY_ID'),
+            'aws_secret_access_key': secret_key or os.getenv('AWS_SECRET_ACCESS_KEY')
+        }
+        
+        # Add endpoint_url for S3-compatible storage
+        if endpoint_url:
+            client_config['endpoint_url'] = endpoint_url
+        
+        self.s3_client = boto3.client('s3', **client_config)
         
         # Ensure bucket exists
         self._ensure_bucket_exists()
         
-        print(f"✓ S3Manager initialized for bucket: {bucket}")
+        print(f"âœ“ S3Manager initialized for bucket: {bucket}")
     
     def _ensure_bucket_exists(self):
         """Create bucket if it doesn't exist"""
         try:
             self.s3_client.head_bucket(Bucket=self.bucket)
-            print(f"✓ Connected to existing S3 bucket: {self.bucket}")
+            print(f"âœ“ Connected to existing S3 bucket: {self.bucket}")
         except ClientError as e:
             error_code = e.response['Error']['Code']
             if error_code == '404':
@@ -81,7 +89,7 @@ class S3Manager:
                         Bucket=self.bucket,
                         CreateBucketConfiguration={'LocationConstraint': self.region}
                     )
-                print(f"✓ Created S3 bucket: {self.bucket}")
+                print(f"âœ“ Created S3 bucket: {self.bucket}")
             else:
                 raise
     
@@ -122,11 +130,11 @@ class S3Manager:
             )
             
             s3_uri = f"s3://{self.bucket}/{s3_key}"
-            print(f"✓ Uploaded to S3: {s3_uri}")
+            print(f"âœ“ Uploaded to S3: {s3_uri}")
             return s3_uri
             
         except Exception as e:
-            print(f"✗ S3 upload failed: {e}")
+            print(f"âœ— S3 upload failed: {e}")
             raise
     
     def generate_presigned_url(
@@ -152,7 +160,7 @@ class S3Manager:
             )
             return url
         except Exception as e:
-            print(f"✗ Failed to generate presigned URL: {e}")
+            print(f"âœ— Failed to generate presigned URL: {e}")
             raise
     
     def delete_file(self, s3_key: str) -> bool:
@@ -167,10 +175,10 @@ class S3Manager:
         """
         try:
             self.s3_client.delete_object(Bucket=self.bucket, Key=s3_key)
-            print(f"✓ Deleted from S3: {s3_key}")
+            print(f"âœ“ Deleted from S3: {s3_key}")
             return True
         except Exception as e:
-            print(f"✗ S3 deletion failed: {e}")
+            print(f"âœ— S3 deletion failed: {e}")
             raise
     
     def file_exists(self, s3_key: str) -> bool:
@@ -227,7 +235,7 @@ class S3Manager:
                 return [obj['Key'] for obj in response['Contents']]
             return []
         except Exception as e:
-            print(f"✗ Failed to list S3 files: {e}")
+            print(f"âœ— Failed to list S3 files: {e}")
             return []
     
     @staticmethod
@@ -258,14 +266,23 @@ def get_s3_config_from_env() -> Dict[str, any]:
     """
     Load S3 configuration from environment variables
     
+    Environment variables:
+    - S3_BUCKET: Bucket name (default: my-rag-documents)
+    - AWS_REGION: AWS region (default: us-east-1)
+    - AWS_ACCESS_KEY_ID: Access key
+    - AWS_SECRET_ACCESS_KEY: Secret key
+    - S3_ENDPOINT_URL: Custom endpoint for S3-compatible storage (MinIO, DigitalOcean Spaces, etc.)
+    - ENABLE_S3: Enable S3 integration (default: false)
+    
     Returns:
-        Configuration dict with bucket, region, credentials, enabled flag
+        Configuration dict with bucket, region, credentials, endpoint_url, enabled flag
     """
     return {
         'bucket': os.getenv('S3_BUCKET', 'my-rag-documents'),
         'region': os.getenv('AWS_REGION', 'us-east-1'),
         'access_key': os.getenv('AWS_ACCESS_KEY_ID'),
         'secret_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
+        'endpoint_url': os.getenv('S3_ENDPOINT_URL'),  # For MinIO, DigitalOcean Spaces, etc.
         'enabled': os.getenv('ENABLE_S3', 'false').lower() == 'true'
     }
 
@@ -281,11 +298,11 @@ def create_s3_manager_from_config(config: Dict[str, any]) -> Optional[S3Manager]
         S3Manager instance or None if S3 not available/enabled
     """
     if not config.get('enabled'):
-        print("ℹ️  S3 integration disabled")
+        print("â„¹ï¸  S3 integration disabled")
         return None
     
     if not S3_AVAILABLE:
-        print("⚠️  S3 enabled but boto3 not installed")
+        print("âš ï¸  S3 enabled but boto3 not installed")
         print("   Install with: pip install boto3")
         return None
     
@@ -294,11 +311,12 @@ def create_s3_manager_from_config(config: Dict[str, any]) -> Optional[S3Manager]
             bucket=config['bucket'],
             region=config['region'],
             access_key=config.get('access_key'),
-            secret_key=config.get('secret_key')
+            secret_key=config.get('secret_key'),
+            endpoint_url=config.get('endpoint_url')
         )
         return manager
     except Exception as e:
-        print(f"⚠️  Failed to initialize S3: {e}")
+        print(f"âš ï¸  Failed to initialize S3: {e}")
         return None
 
 
@@ -311,7 +329,7 @@ if __name__ == "__main__":
         manager = create_s3_manager_from_config(config)
         
         if manager:
-            print("\n✓ S3Manager test successful")
+            print("\nâœ“ S3Manager test successful")
             print(f"  Bucket: {manager.bucket}")
             print(f"  Region: {manager.region}")
             
