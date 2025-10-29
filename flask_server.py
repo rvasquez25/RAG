@@ -1,35 +1,25 @@
 """
-Flask RAG Server with Centralized Table, Batch Upload, and S3 Integration
-Provides REST API for document ingestion and querying with automatic cleanup
+Flask RAG Server - Refactored with Modular Architecture
+Provides REST API for document ingestion and querying
+Uses separate modules for S3 and document processing
 """
 
 import os
-import io
 import json
-import shutil
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
+import time
+from typing import Optional, Dict, Any
+from datetime import datetime
 from pathlib import Path
-import threading
 from concurrent.futures import ThreadPoolExecutor
-import traceback
+import threading
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
 from advanced_rag import create_production_pipeline, AdvancedRAGPipeline
-from rag_pipeline import PDFExtractor, ChunkingStrategy
-
-# Optional: Import boto3 for S3 support
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-    S3_AVAILABLE = True
-except ImportError:
-    S3_AVAILABLE = False
-    print("⚠️  boto3 not installed. S3 features disabled.")
-    print("   Install with: pip install boto3")
+from s3_manager import get_s3_config_from_env, create_s3_manager_from_config, S3Manager
+from document_processor import DocumentProcessor, ProcessingJobTracker
 
 
 # ============================================
@@ -43,10 +33,6 @@ CENTRAL_TABLE = "document_embeddings"
 UPLOAD_DIR = Path("./uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Temporary processing directory
-TEMP_DIR = Path("./temp")
-TEMP_DIR.mkdir(exist_ok=True)
-
 # Database configuration
 DB_CONFIG = {
     'host': os.getenv('SINGLESTORE_HOST', 'localhost'),
@@ -56,131 +42,15 @@ DB_CONFIG = {
     'database': os.getenv('SINGLESTORE_DATABASE', 'rag_db')
 }
 
-# S3 Configuration (optional)
-S3_CONFIG = {
-    'bucket': os.getenv('S3_BUCKET', 'my-rag-documents'),
-    'region': os.getenv('AWS_REGION', 'us-east-1'),
-    'access_key': os.getenv('AWS_ACCESS_KEY_ID'),
-    'secret_key': os.getenv('AWS_SECRET_ACCESS_KEY'),
-    'enabled': os.getenv('ENABLE_S3', 'false').lower() == 'true'
-}
+# S3 Configuration
+S3_CONFIG = get_s3_config_from_env()
 
 # Thread pool for async processing
 executor = ThreadPoolExecutor(max_workers=4)
 
 # Job tracking
-processing_jobs: Dict[str, Dict[str, Any]] = {}
+job_tracker = ProcessingJobTracker()
 job_lock = threading.Lock()
-
-
-# ============================================
-# S3 Helper Class
-# ============================================
-
-class S3Manager:
-    """Manage S3 uploads and presigned URLs"""
-    
-    def __init__(self, bucket: str, region: str = 'us-east-1'):
-        """Initialize S3 client"""
-        if not S3_AVAILABLE:
-            raise ImportError("boto3 not installed. Install with: pip install boto3")
-        
-        self.bucket = bucket
-        self.region = region
-        self.s3_client = boto3.client(
-            's3',
-            region_name=region,
-            aws_access_key_id=S3_CONFIG['access_key'],
-            aws_secret_access_key=S3_CONFIG['secret_key']
-        )
-        
-        # Ensure bucket exists
-        try:
-            self.s3_client.head_bucket(Bucket=bucket)
-            print(f"✓ Connected to S3 bucket: {bucket}")
-        except ClientError as e:
-            error_code = e.response['Error']['Code']
-            if error_code == '404':
-                print(f"Creating S3 bucket: {bucket}")
-                self.s3_client.create_bucket(Bucket=bucket)
-            else:
-                raise
-    
-    def upload_file(
-        self,
-        file_path: Path,
-        s3_key: str,
-        metadata: Dict[str, str] = None
-    ) -> str:
-        """
-        Upload file to S3
-        
-        Args:
-            file_path: Local file path
-            s3_key: S3 object key (path in bucket)
-            metadata: Optional metadata dict
-            
-        Returns:
-            S3 URI (s3://bucket/key)
-        """
-        try:
-            extra_args = {}
-            if metadata:
-                # S3 metadata keys must be lowercase
-                extra_args['Metadata'] = {
-                    k.lower().replace(' ', '-'): str(v) 
-                    for k, v in metadata.items()
-                }
-            
-            self.s3_client.upload_file(
-                str(file_path),
-                self.bucket,
-                s3_key,
-                ExtraArgs=extra_args
-            )
-            
-            s3_uri = f"s3://{self.bucket}/{s3_key}"
-            print(f"✓ Uploaded to S3: {s3_uri}")
-            return s3_uri
-            
-        except Exception as e:
-            print(f"✗ S3 upload failed: {e}")
-            raise
-    
-    def generate_presigned_url(
-        self,
-        s3_key: str,
-        expiration: int = 3600
-    ) -> str:
-        """
-        Generate presigned URL for downloading
-        
-        Args:
-            s3_key: S3 object key
-            expiration: URL expiration in seconds (default 1 hour)
-            
-        Returns:
-            Presigned URL
-        """
-        try:
-            url = self.s3_client.generate_presigned_url(
-                'get_object',
-                Params={'Bucket': self.bucket, 'Key': s3_key},
-                ExpiresIn=expiration
-            )
-            return url
-        except Exception as e:
-            print(f"✗ Failed to generate presigned URL: {e}")
-            raise
-    
-    def delete_file(self, s3_key: str):
-        """Delete file from S3"""
-        try:
-            self.s3_client.delete_object(Bucket=self.bucket, Key=s3_key)
-            print(f"✓ Deleted from S3: {s3_key}")
-        except Exception as e:
-            print(f"✗ S3 deletion failed: {e}")
-            raise
 
 
 # ============================================
@@ -189,6 +59,7 @@ class S3Manager:
 
 pipeline: Optional[AdvancedRAGPipeline] = None
 s3_manager: Optional[S3Manager] = None
+document_processor: Optional[DocumentProcessor] = None
 
 
 def get_pipeline() -> AdvancedRAGPipeline:
@@ -207,181 +78,30 @@ def get_pipeline() -> AdvancedRAGPipeline:
 def get_s3_manager() -> Optional[S3Manager]:
     """Get or create S3 manager instance"""
     global s3_manager
-    
-    if not S3_CONFIG['enabled']:
-        return None
-    
-    if not S3_AVAILABLE:
-        print("⚠️  S3 enabled but boto3 not installed")
-        return None
-    
     if s3_manager is None:
-        try:
-            s3_manager = S3Manager(
-                S3_CONFIG['bucket'],
-                S3_CONFIG['region']
-            )
-        except Exception as e:
-            print(f"⚠️  Failed to initialize S3: {e}")
-            return None
-    
+        s3_manager = create_s3_manager_from_config(S3_CONFIG)
     return s3_manager
 
 
-# ============================================
-# Document Processing Functions
-# ============================================
-
-def process_document(
-    file_path: Path,
-    filename: str,
-    metadata: Dict[str, Any],
-    job_id: str = None,
-    upload_to_s3: bool = False
-) -> Dict[str, Any]:
-    """
-    Process a document: ingest to DB, optionally upload to S3, then delete local file
-    
-    Args:
-        file_path: Local file path
-        filename: Original filename
-        metadata: Document metadata
-        job_id: Optional job ID for tracking
-        upload_to_s3: Whether to upload to S3
-        
-    Returns:
-        Result dictionary with processing info
-    """
-    s3_uri = None
-    s3_key = None
-    
-    try:
-        # Update job status
-        if job_id:
-            with job_lock:
-                if job_id in processing_jobs:
-                    processing_jobs[job_id]['status'] = 'processing'
-                    processing_jobs[job_id]['current_file'] = filename
-        
+def get_document_processor() -> DocumentProcessor:
+    """Get or create document processor instance"""
+    global document_processor
+    if document_processor is None:
         rag = get_pipeline()
+        s3 = get_s3_manager()
         
-        # Extract text from PDF
-        print(f"Extracting text from {filename}...")
-        documents = PDFExtractor.extract_text(str(file_path))
-        
-        if not documents:
-            raise ValueError("No text could be extracted from PDF")
-        
-        # Chunk documents
-        print(f"Chunking {filename}...")
-        chunked_docs = ChunkingStrategy.chunk_documents(documents)
-        
-        # Add metadata to all chunks
-        file_metadata = {
-            "document_id": file_path.stem,
-            "source_file": filename,
-            "file_path": str(file_path),
-            "total_pages": len(documents),
-            "total_chunks": len(chunked_docs),
-            "file_size_kb": file_path.stat().st_size // 1024,
-            "ingestion_date": datetime.now().isoformat(),
-            **metadata
-        }
-        
-        for chunk in chunked_docs:
-            chunk.metadata = {**chunk.metadata, **file_metadata}
-        
-        # Generate embeddings
-        print(f"Generating embeddings for {filename}...")
-        texts = [doc.content for doc in chunked_docs]
-        embeddings = rag.embedder.embed_batch(texts)
-        
-        # Store in centralized table
-        print(f"Storing {len(chunked_docs)} chunks in database...")
-        rag.vector_db.insert_embeddings(
-            CENTRAL_TABLE,
-            chunked_docs,
-            embeddings
+        document_processor = DocumentProcessor(
+            rag_pipeline=rag,
+            s3_manager=s3,
+            table_name=CENTRAL_TABLE,
+            auto_cleanup=True
         )
-        
-        print(f"✓ Successfully ingested {filename} to database")
-        
-        # Upload to S3 if enabled
-        if upload_to_s3:
-            s3 = get_s3_manager()
-            if s3:
-                # Create S3 key: documents/{date}/{filename}
-                date_prefix = datetime.now().strftime('%Y/%m/%d')
-                s3_key = f"documents/{date_prefix}/{filename}"
-                
-                print(f"Uploading {filename} to S3...")
-                s3_uri = s3.upload_file(
-                    file_path,
-                    s3_key,
-                    metadata={
-                        'original-filename': filename,
-                        'document-id': file_path.stem,
-                        'upload-date': datetime.now().isoformat(),
-                        'document-type': metadata.get('document_type', 'document'),
-                        'department': metadata.get('department', 'general')
-                    }
-                )
-                
-                print(f"✓ Uploaded {filename} to S3: {s3_uri}")
-        
-        # Delete local file after successful processing
-        try:
-            file_path.unlink()
-            print(f"✓ Deleted local file: {file_path}")
-        except Exception as e:
-            print(f"⚠️  Failed to delete local file {file_path}: {e}")
-            # Don't fail the whole operation if cleanup fails
-        
-        result = {
-            'filename': filename,
-            'status': 'success',
-            'chunks': len(chunked_docs),
-            'pages': len(documents),
-            's3_uri': s3_uri,
-            's3_key': s3_key,
-            'local_file_deleted': True
-        }
-        
-        # Update job tracking
-        if job_id:
-            with job_lock:
-                if job_id in processing_jobs:
-                    processing_jobs[job_id]['processed_files'].append(result)
-                    processing_jobs[job_id]['successful'] += 1
-        
-        return result
-        
-    except Exception as e:
-        error_msg = str(e)
-        print(f"✗ Failed to process {filename}: {error_msg}")
-        traceback.print_exc()
-        
-        # Update job tracking
-        if job_id:
-            with job_lock:
-                if job_id in processing_jobs:
-                    processing_jobs[job_id]['processed_files'].append({
-                        'filename': filename,
-                        'status': 'failed',
-                        'error': error_msg
-                    })
-                    processing_jobs[job_id]['failed'] += 1
-        
-        # Try to clean up local file even on error
-        try:
-            if file_path.exists():
-                file_path.unlink()
-                print(f"✓ Cleaned up local file after error: {file_path}")
-        except Exception as cleanup_error:
-            print(f"⚠️  Failed to clean up {file_path}: {cleanup_error}")
-        
-        raise Exception(f"Failed to process {filename}: {error_msg}")
+    return document_processor
 
+
+# ============================================
+# Background Processing Functions
+# ============================================
 
 def process_document_async(
     file_path: Path,
@@ -390,11 +110,37 @@ def process_document_async(
     job_id: str,
     upload_to_s3: bool = False
 ):
-    """Async wrapper for document processing"""
+    """Process document in background thread"""
     try:
-        process_document(file_path, filename, metadata, job_id, upload_to_s3)
+        processor = get_document_processor()
+        
+        with job_lock:
+            job_tracker.update_job(
+                job_id,
+                status='processing',
+                current_file=filename
+            )
+        
+        result = processor.process_document(
+            file_path,
+            filename,
+            metadata,
+            upload_to_s3=upload_to_s3,
+            job_id=job_id
+        )
+        
+        with job_lock:
+            job_tracker.update_job(job_id, result=result)
+        
     except Exception as e:
-        print(f"Async processing failed: {e}")
+        error_result = {
+            'filename': filename,
+            'status': 'failed',
+            'error': str(e)
+        }
+        
+        with job_lock:
+            job_tracker.update_job(job_id, result=error_result)
 
 
 # ============================================
@@ -422,8 +168,8 @@ def allowed_file(filename: str) -> bool:
 def root():
     """Root endpoint"""
     return jsonify({
-        "message": "RAG API Server (Flask)",
-        "version": "1.0.0",
+        "message": "RAG API Server (Flask - Refactored)",
+        "version": "2.0.0",
         "s3_enabled": S3_CONFIG['enabled'],
         "endpoints": {
             "health": "/health",
@@ -434,6 +180,7 @@ def root():
             "search": "/search (GET)",
             "documents": "/documents (GET)",
             "delete": "/documents/<source> (DELETE)",
+            "download": "/documents/<source>/download (GET)",
             "jobs": "/jobs (GET)",
             "job_status": "/jobs/<job_id> (GET)"
         }
@@ -450,7 +197,6 @@ def health_check():
         conn = rag.vector_db.get_connection()
         cursor = conn.cursor()
         
-        # Count documents and chunks
         cursor.execute(f"SELECT COUNT(DISTINCT source) FROM {CENTRAL_TABLE}")
         doc_count = cursor.fetchone()[0] if cursor.rowcount > 0 else 0
         
@@ -485,10 +231,10 @@ def get_statistics():
         cursor = conn.cursor()
         
         # Total documents and chunks
-        cursor.execute(f"SELECT COUNT(DISTINCT source) as doc_count FROM {CENTRAL_TABLE}")
+        cursor.execute(f"SELECT COUNT(DISTINCT source) FROM {CENTRAL_TABLE}")
         doc_count = cursor.fetchone()[0]
         
-        cursor.execute(f"SELECT COUNT(*) as chunk_count FROM {CENTRAL_TABLE}")
+        cursor.execute(f"SELECT COUNT(*) FROM {CENTRAL_TABLE}")
         chunk_count = cursor.fetchone()[0]
         
         # By document type
@@ -552,7 +298,6 @@ def get_statistics():
 def query_documents():
     """Query the RAG system"""
     try:
-        import time
         data = request.get_json()
         
         if not data or 'query' not in data:
@@ -562,76 +307,18 @@ def query_documents():
         top_k = data.get('top_k', 5)
         retrieval_k = data.get('retrieval_k', 20)
         use_reranking = data.get('use_reranking', True)
-        document_type = data.get('document_type')
-        department = data.get('department')
         min_score = data.get('min_score')
         
         rag = get_pipeline()
         start_time = time.time()
         
-        # Query with filters if provided
-        if document_type or department:
-            # Custom query with metadata filtering
-            conn = rag.vector_db.get_connection()
-            cursor = conn.cursor()
-            
-            query_embedding = rag.embedder.embed_text(query_text)
-            query_json = json.dumps(query_embedding.tolist())
-            
-            where_clauses = []
-            params = [query_json]
-            
-            if document_type:
-                where_clauses.append("JSON_EXTRACT(metadata, '$.document_type') = %s")
-                params.append(document_type)
-            
-            if department:
-                where_clauses.append("JSON_EXTRACT(metadata, '$.department') = %s")
-                params.append(department)
-            
-            if min_score:
-                where_clauses.append("DOT_PRODUCT(embedding, JSON_ARRAY_PACK(%s)) >= %s")
-                params.append(min_score)
-            
-            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
-            params.append(top_k)
-            
-            sql = f"""
-            SELECT 
-                content, source, page_num, chunk_index, metadata,
-                DOT_PRODUCT(embedding, JSON_ARRAY_PACK(%s)) as score
-            FROM {CENTRAL_TABLE}
-            WHERE {where_sql}
-            ORDER BY score DESC
-            LIMIT %s
-            """
-            
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-            
-            results = []
-            for row in rows:
-                results.append({
-                    "content": row[0],
-                    "source": row[1],
-                    "page_num": row[2],
-                    "chunk_index": row[3],
-                    "metadata": json.loads(row[4]) if row[4] else {},
-                    "similarity_score": float(row[5])
-                })
-            
-            cursor.close()
-            conn.close()
-            
-        else:
-            # Standard query
-            results = rag.query(
-                query_text,
-                top_k=top_k,
-                retrieval_k=retrieval_k,
-                use_reranking=use_reranking,
-                score_threshold=min_score
-            )
+        results = rag.query(
+            query_text,
+            top_k=top_k,
+            retrieval_k=retrieval_k,
+            use_reranking=use_reranking,
+            score_threshold=min_score
+        )
         
         retrieval_time = (time.time() - start_time) * 1000
         
@@ -655,19 +342,7 @@ def simple_search():
             return jsonify({"error": "Missing 'q' parameter"}), 400
         
         top_k = int(request.args.get('top_k', 5))
-        document_type = request.args.get('document_type')
-        department = request.args.get('department')
         
-        # Reuse query endpoint logic
-        request_data = {
-            'query': query,
-            'top_k': top_k,
-            'document_type': document_type,
-            'department': department
-        }
-        
-        # Simulate POST request
-        import time
         rag = get_pipeline()
         start_time = time.time()
         
@@ -697,19 +372,7 @@ def simple_search():
 
 @app.route('/upload', methods=['POST'])
 def upload_document():
-    """
-    Upload a single document
-    
-    Form data:
-        - file: PDF file (required)
-        - document_type: Document type (default: "document")
-        - department: Department (default: "general")
-        - tags: Comma-separated tags
-        - author: Document author
-        - project_id: Project ID
-        - client_name: Client name
-        - upload_to_s3: Whether to upload to S3 (default: based on config)
-    """
+    """Upload a single document"""
     try:
         # Check if file is present
         if 'file' not in request.files:
@@ -749,7 +412,13 @@ def upload_document():
         }
         
         # Process document
-        result = process_document(file_path, filename, metadata, upload_to_s3=upload_to_s3)
+        processor = get_document_processor()
+        result = processor.process_document(
+            file_path,
+            filename,
+            metadata,
+            upload_to_s3=upload_to_s3
+        )
         
         # Generate presigned URL if file is in S3
         presigned_url = None
@@ -774,31 +443,12 @@ def upload_document():
         })
         
     except Exception as e:
-        # Cleanup on error
-        if 'file_path' in locals() and Path(file_path).exists():
-            try:
-                Path(file_path).unlink()
-            except:
-                pass
         return jsonify({"error": str(e)}), 500
 
 
 @app.route('/upload/batch', methods=['POST'])
 def upload_batch():
-    """
-    Upload multiple documents at once
-    
-    Form data:
-        - files: List of PDF files (required)
-        - document_type: Document type for all files
-        - department: Department for all files
-        - tags: Comma-separated tags
-        - author: Author
-        - project_id: Project ID
-        - client_name: Client name
-        - async_processing: Process in background (default: false)
-        - upload_to_s3: Upload to S3 (default: based on config)
-    """
+    """Upload multiple documents at once"""
     try:
         # Check if files are present
         if 'files' not in request.files:
@@ -824,15 +474,7 @@ def upload_batch():
         
         # Initialize job tracking
         with job_lock:
-            processing_jobs[job_id] = {
-                'job_id': job_id,
-                'total_files': len(files),
-                'successful': 0,
-                'failed': 0,
-                'status': 'pending',
-                'processed_files': [],
-                'started_at': datetime.now().isoformat()
-            }
+            job_tracker.create_job(job_id, len(files))
         
         # Prepare metadata
         metadata = {
@@ -882,66 +524,36 @@ def upload_batch():
                 "failed": 0,
                 "job_id": job_id,
                 "status": "queued",
-                "message": f"Batch processing started. Check /jobs/{job_id} for status",
-                "files": [
-                    {
-                        "filename": filename,
-                        "status": "queued",
-                        "job_id": job_id
-                    }
-                    for _, filename in file_paths
-                ]
+                "message": f"Batch processing started. Check /jobs/{job_id} for status"
             })
         else:
             # Process synchronously
-            results = []
-            for file_path, filename in file_paths:
-                try:
-                    result = process_document(
-                        file_path,
-                        filename,
-                        metadata,
-                        job_id,
-                        upload_to_s3
-                    )
-                    
-                    # Generate presigned URL if in S3
-                    presigned_url = None
-                    if result.get('s3_key') and upload_to_s3:
-                        s3 = get_s3_manager()
-                        if s3:
-                            try:
-                                presigned_url = s3.generate_presigned_url(result['s3_key'])
-                            except Exception as e:
-                                print(f"Failed to generate presigned URL: {e}")
-                    
-                    results.append({
-                        "filename": filename,
-                        "status": "success",
-                        "chunks_created": result['chunks'],
-                        "pages": result['pages'],
-                        "s3_uploaded": bool(result.get('s3_uri')),
-                        "download_url": presigned_url,
-                        "local_file_deleted": result.get('local_file_deleted', False),
-                        "message": "Processed successfully"
-                    })
-                    
-                except Exception as e:
-                    results.append({
-                        "filename": filename,
-                        "status": "failed",
-                        "message": str(e)
-                    })
+            processor = get_document_processor()
+            batch_result = processor.process_batch(
+                file_paths,
+                metadata,
+                upload_to_s3=upload_to_s3,
+                job_id=job_id
+            )
             
-            with job_lock:
-                processing_jobs[job_id]['status'] = 'completed'
+            # Add presigned URLs if S3 enabled
+            s3 = get_s3_manager()
+            if s3 and upload_to_s3:
+                for file_result in batch_result['files']:
+                    if file_result.get('s3_key'):
+                        try:
+                            file_result['download_url'] = s3.generate_presigned_url(
+                                file_result['s3_key']
+                            )
+                        except Exception as e:
+                            print(f"Failed to generate presigned URL: {e}")
             
             return jsonify({
-                "total_files": len(files),
-                "successful": processing_jobs[job_id]['successful'],
-                "failed": processing_jobs[job_id]['failed'],
+                "total_files": batch_result['total'],
+                "successful": batch_result['successful'],
+                "failed": batch_result['failed'],
                 "job_id": job_id,
-                "files": results
+                "files": batch_result['files']
             })
         
     except Exception as e:
@@ -956,10 +568,12 @@ def upload_batch():
 def get_job_status(job_id: str):
     """Get status of a batch processing job"""
     with job_lock:
-        if job_id not in processing_jobs:
+        job = job_tracker.get_job(job_id)
+        
+        if not job:
             return jsonify({"error": "Job not found"}), 404
         
-        return jsonify(processing_jobs[job_id])
+        return jsonify(job)
 
 
 @app.route('/jobs', methods=['GET'])
@@ -967,7 +581,7 @@ def list_jobs():
     """List all jobs"""
     with job_lock:
         return jsonify({
-            "jobs": list(processing_jobs.values())
+            "jobs": job_tracker.get_all_jobs()
         })
 
 
@@ -1009,11 +623,10 @@ def list_documents():
             JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.department')) as dept,
             JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.total_pages')) as pages,
             JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.ingestion_date')) as ingested,
-            JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.s3_uri')) as s3_uri,
             COUNT(*) as chunks
         FROM {CENTRAL_TABLE}
         WHERE {where_sql}
-        GROUP BY source, doc_id, type, dept, pages, ingested, s3_uri
+        GROUP BY source, doc_id, type, dept, pages, ingested
         ORDER BY ingested DESC
         LIMIT %s
         """
@@ -1022,30 +635,16 @@ def list_documents():
         rows = cursor.fetchall()
         
         documents = []
-        s3 = get_s3_manager()
-        
         for row in rows:
-            doc_info = {
+            documents.append({
                 "source": row[0],
                 "document_id": row[1],
                 "type": row[2],
                 "department": row[3],
                 "pages": row[4],
                 "ingestion_date": row[5],
-                "s3_uri": row[6],
-                "chunks": row[7]
-            }
-            
-            # Add presigned URL if file is in S3
-            if row[6] and s3:
-                try:
-                    # Extract S3 key from URI (s3://bucket/key)
-                    s3_key = row[6].replace(f"s3://{S3_CONFIG['bucket']}/", "")
-                    doc_info["download_url"] = s3.generate_presigned_url(s3_key)
-                except Exception as e:
-                    print(f"Failed to generate presigned URL: {e}")
-            
-            documents.append(doc_info)
+                "chunks": row[6]
+            })
         
         cursor.close()
         conn.close()
@@ -1067,14 +666,6 @@ def delete_document(source: str):
         conn = rag.vector_db.get_connection()
         cursor = conn.cursor()
         
-        # Get S3 info before deleting
-        cursor.execute(
-            f"SELECT JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.s3_uri')) FROM {CENTRAL_TABLE} WHERE source = %s LIMIT 1",
-            (source,)
-        )
-        row = cursor.fetchone()
-        s3_uri = row[0] if row else None
-        
         # Delete all chunks from this document
         cursor.execute(f"DELETE FROM {CENTRAL_TABLE} WHERE source = %s", (source,))
         deleted_count = cursor.rowcount
@@ -1086,76 +677,25 @@ def delete_document(source: str):
         if deleted_count == 0:
             return jsonify({"error": "Document not found"}), 404
         
-        # Delete from S3 if it exists there
-        s3_deleted = False
-        if s3_uri:
-            s3 = get_s3_manager()
-            if s3:
-                try:
-                    s3_key = s3_uri.replace(f"s3://{S3_CONFIG['bucket']}/", "")
-                    s3.delete_file(s3_key)
-                    s3_deleted = True
-                except Exception as e:
-                    print(f"Failed to delete from S3: {e}")
-        
         return jsonify({
             "message": f"Deleted {deleted_count} chunks from {source}",
-            "deleted_chunks": deleted_count,
-            "s3_deleted": s3_deleted
+            "deleted_chunks": deleted_count
         })
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# ============================================
-# Download Endpoint
-# ============================================
-
 @app.route('/documents/<source>/download', methods=['GET'])
 def download_document(source: str):
-    """
-    Get download URL for a document
-    If in S3, returns presigned URL
-    """
+    """Get download URL for a document (if in S3)"""
     try:
-        rag = get_pipeline()
-        conn = rag.vector_db.get_connection()
-        cursor = conn.cursor()
-        
-        # Get S3 URI
-        cursor.execute(
-            f"SELECT JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.s3_uri')) FROM {CENTRAL_TABLE} WHERE source = %s LIMIT 1",
-            (source,)
-        )
-        row = cursor.fetchone()
-        
-        cursor.close()
-        conn.close()
-        
-        if not row or not row[0]:
-            return jsonify({
-                "error": "Document not found in S3. File may have been deleted locally."
-            }), 404
-        
-        s3_uri = row[0]
-        s3 = get_s3_manager()
-        
-        if not s3:
-            return jsonify({
-                "error": "S3 not configured"
-            }), 503
-        
-        # Generate presigned URL
-        s3_key = s3_uri.replace(f"s3://{S3_CONFIG['bucket']}/", "")
-        presigned_url = s3.generate_presigned_url(s3_key, expiration=3600)  # 1 hour
-        
+        # This endpoint would need S3 URI stored in metadata
+        # For now, return not implemented
         return jsonify({
-            "source": source,
-            "s3_uri": s3_uri,
-            "download_url": presigned_url,
-            "expires_in": 3600
-        })
+            "error": "Download endpoint requires S3 URI in metadata",
+            "message": "This feature is available when documents are uploaded to S3"
+        }), 501
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1166,30 +706,38 @@ def download_document(source: str):
 # ============================================
 
 def initialize():
-    """Initialize RAG pipeline and S3"""
+    """Initialize all components"""
     try:
         # Initialize pipeline
+        print("\nInitializing RAG pipeline...")
         rag = get_pipeline()
         print(f"✓ RAG Pipeline initialized")
         print(f"✓ Using centralized table: {CENTRAL_TABLE}")
         
         # Initialize S3 if enabled
         if S3_CONFIG['enabled']:
+            print("\nInitializing S3...")
             s3 = get_s3_manager()
             if s3:
                 print(f"✓ S3 integration enabled")
-                print(f"  Bucket: {S3_CONFIG['bucket']}")
             else:
                 print(f"⚠️  S3 enabled but initialization failed")
         else:
-            print(f"ℹ️  S3 integration disabled")
+            print(f"\nℹ️  S3 integration disabled")
+        
+        # Initialize document processor
+        print("\nInitializing document processor...")
+        processor = get_document_processor()
+        print(f"✓ Document processor ready")
+        
     except Exception as e:
         print(f"✗ Failed to initialize: {e}")
+        raise
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  RAG API Server (Flask)")
+    print("  RAG API Server (Flask - Refactored)")
     print("=" * 60)
     print(f"Centralized Table: {CENTRAL_TABLE}")
     print(f"Upload Directory: {UPLOAD_DIR}")
@@ -1201,8 +749,14 @@ if __name__ == "__main__":
     print()
     
     # Initialize before starting server
-    print("Initializing...")
+    print("Initializing components...")
     initialize()
+    print()
+    
+    print("=" * 60)
+    print("Server ready!")
+    print("API Documentation: http://localhost:8000/")
+    print("=" * 60)
     print()
     
     # Run Flask app
