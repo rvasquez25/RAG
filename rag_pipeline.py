@@ -295,9 +295,19 @@ class SingleStoreVectorDB:
             logger.error(f"Failed to connect to SingleStore: {e}")
             raise
     
+    def get_connection(self):
+        """
+        Get a new database connection
+        
+        Returns:
+            pymysql connection object
+        """
+        return pymysql.connect(**self.connection_params)
+    
     def create_table(self, table_name: str, embedding_dim: int):
         """
         Create a table for storing embeddings (SingleStore 8.9+ compatible)
+        Only creates if table doesn't exist - preserves existing data
         
         Args:
             table_name: Name of the table
@@ -307,8 +317,13 @@ class SingleStoreVectorDB:
         cursor = conn.cursor()
         
         try:
-            # Drop existing table if needed
-            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            # Check if table already exists
+            cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+            table_exists = cursor.fetchone() is not None
+            
+            if table_exists:
+                logger.info(f"Table {table_name} already exists, skipping creation")
+                return
             
             # Create ROWSTORE table (not columnstore) to support unique constraints
             # SingleStore columnstore tables have limitations on multiple unique indexes
@@ -336,6 +351,52 @@ class SingleStoreVectorDB:
             
         except Exception as e:
             logger.error(f"Error creating table: {e}")
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def reset_table(self, table_name: str, embedding_dim: int):
+        """
+        Drop and recreate table (DELETES ALL DATA!)
+        Use this only for testing or when you want to start fresh
+        
+        Args:
+            table_name: Name of the table
+            embedding_dim: Dimension of embedding vectors
+        """
+        conn = pymysql.connect(**self.connection_params)
+        cursor = conn.cursor()
+        
+        try:
+            logger.warning(f"DROPPING table {table_name} - all data will be lost!")
+            cursor.execute(f"DROP TABLE IF EXISTS {table_name}")
+            
+            # Create new table
+            create_table_sql = f"""
+            CREATE ROWSTORE TABLE {table_name} (
+                chunk_id VARCHAR(255) NOT NULL,
+                content TEXT NOT NULL,
+                source VARCHAR(512) NOT NULL,
+                page_num INT,
+                chunk_index INT,
+                metadata JSON,
+                embedding VECTOR({embedding_dim}) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chunk_id),
+                SHARD KEY (chunk_id),
+                KEY (source),
+                KEY (page_num),
+                KEY (source, page_num)
+            )
+            """
+            cursor.execute(create_table_sql)
+            conn.commit()
+            logger.info(f"Reset table {table_name} successfully")
+            
+        except Exception as e:
+            logger.error(f"Error resetting table: {e}")
             conn.rollback()
             raise
         finally:
