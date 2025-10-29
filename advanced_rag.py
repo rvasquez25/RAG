@@ -444,7 +444,8 @@ class QueryExpansion:
 def create_production_pipeline(
     singlestore_config: Dict[str, Any],
     use_reranker: bool = True,
-    use_hybrid: bool = True
+    use_hybrid: bool = True,
+    table_name: str = "document_embeddings"
 ) -> AdvancedRAGPipeline:
     """
     Factory function to create production-ready pipeline
@@ -453,6 +454,7 @@ def create_production_pipeline(
         singlestore_config: Database configuration dictionary
         use_reranker: Whether to enable reranking
         use_hybrid: Whether to use hybrid search
+        table_name: Centralized table name (default: document_embeddings)
         
     Returns:
         Configured AdvancedRAGPipeline instance
@@ -465,6 +467,9 @@ def create_production_pipeline(
     # Initialize vector database
     vector_db = SingleStoreVectorDB(**singlestore_config)
     
+    # Ensure centralized table exists
+    vector_db.create_table(table_name, embedder.embedding_dim)
+    
     # Initialize reranker if requested
     reranker = Reranker() if use_reranker else None
     
@@ -476,7 +481,8 @@ def create_production_pipeline(
         use_hybrid=use_hybrid,
         hybrid_alpha=0.5,  # Equal weight to dense and sparse
         chunk_size=512,
-        overlap=128
+        overlap=128,
+        table_name=table_name
     )
     
     return pipeline
