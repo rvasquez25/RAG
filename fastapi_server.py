@@ -78,6 +78,7 @@ class UploadResponse(BaseModel):
     filename: str
     status: str
     chunks_created: Optional[int] = None
+    pages: Optional[int] = None
     message: Optional[str] = None
     job_id: Optional[str] = None
 
@@ -166,7 +167,8 @@ async def process_document_async(
         processing_jobs[job_id]['processed_files'].append({
             'filename': filename,
             'status': 'success',
-            'chunks': result['chunks']
+            'chunks': result['chunks'],
+            'pages': result['pages']
         })
         processing_jobs[job_id]['successful'] += 1
         
@@ -262,10 +264,10 @@ async def startup_event():
     try:
         # Initialize pipeline and ensure table exists
         rag = get_pipeline()
-        print(f"✓ RAG Pipeline initialized")
-        print(f"✓ Using centralized table: {CENTRAL_TABLE}")
+        print(f"âœ“ RAG Pipeline initialized")
+        print(f"âœ“ Using centralized table: {CENTRAL_TABLE}")
     except Exception as e:
-        print(f"✗ Failed to initialize: {e}")
+        print(f"âœ— Failed to initialize: {e}")
 
 
 @app.on_event("shutdown")
@@ -548,6 +550,7 @@ async def upload_document(
             filename=file.filename,
             status="success",
             chunks_created=result['chunks'],
+            pages=result['pages'],
             message=f"Document ingested successfully: {result['chunks']} chunks from {result['pages']} pages"
         )
         
@@ -654,6 +657,7 @@ async def upload_batch(
                         filename=filename,
                         status="success",
                         chunks_created=result['chunks'],
+                        pages=result['pages'],
                         message=f"Processed successfully"
                     ))
                     processing_jobs[job_id]['successful'] += 1
