@@ -72,14 +72,37 @@ class RAGEvaluator:
         """
         Load questions and expected responses from YAML file
         
+        Supported formats:
+        1. Simple list:
+           - question: "What is X?"
+             expectedResponse: "Y"
+        
+        2. Nested format:
+           questions:
+             - question: "What is X?"
+               expectedResponse: "Y"
+        
+        3. Alternative field names (q/a, answer, expected_response)
+        
         Args:
             yaml_path: Path to YAML file
             
         Returns:
             List of dicts with 'question' and 'expectedResponse' keys
+            
+        Raises:
+            ValueError: If YAML format is invalid or missing required fields
         """
-        with open(yaml_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
+        try:
+            with open(yaml_path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+        except FileNotFoundError:
+            raise ValueError(f"YAML file not found: {yaml_path}")
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML format: {e}")
+        
+        if not data:
+            raise ValueError("YAML file is empty")
         
         # Handle different YAML formats
         if isinstance(data, list):
@@ -90,23 +113,61 @@ class RAGEvaluator:
             questions = data['questions']
         else:
             raise ValueError(
-                "YAML format not recognized. Expected list of dicts or "
-                "{questions: [...]}"
+                "YAML format not recognized. Expected:\n"
+                "- List of question/answer dicts\n"
+                "- Dict with 'questions' key containing a list\n\n"
+                "Example:\n"
+                "- question: \"What is X?\"\n"
+                "  expectedResponse: \"Y\""
             )
         
-        # Normalize field names
+        if not isinstance(questions, list):
+            raise ValueError("Questions must be a list")
+        
+        if not questions:
+            raise ValueError("Questions list is empty")
+        
+        # Normalize field names and validate
         normalized = []
-        for item in questions:
-            normalized.append({
-                'question': item.get('question') or item.get('q'),
-                'expectedResponse': (
-                    item.get('expectedResponse') or 
-                    item.get('expected_response') or 
-                    item.get('answer') or 
-                    item.get('a')
+        for i, item in enumerate(questions, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Question {i} is not a dict: {item}")
+            
+            # Extract question
+            question = (
+                item.get('question') or 
+                item.get('q') or 
+                item.get('query')
+            )
+            
+            # Extract expected response
+            expected = (
+                item.get('expectedResponse') or 
+                item.get('expected_response') or 
+                item.get('answer') or 
+                item.get('a') or
+                item.get('expected')
+            )
+            
+            # Validate required fields
+            if not question:
+                raise ValueError(
+                    f"Question {i} missing 'question' field. "
+                    f"Available keys: {list(item.keys())}"
                 )
+            
+            if not expected:
+                raise ValueError(
+                    f"Question {i} missing 'expectedResponse' field. "
+                    f"Available keys: {list(item.keys())}"
+                )
+            
+            normalized.append({
+                'question': str(question).strip(),
+                'expectedResponse': str(expected).strip()
             })
         
+        logger.info(f"Loaded {len(normalized)} questions from {yaml_path}")
         return normalized
     
     def compute_semantic_similarity(
@@ -274,14 +335,14 @@ class RAGEvaluator:
                 results.append(result)
                 
                 if verbose:
-                    status = "✓" if result.semantic_match else "✗"
+                    status = "âœ“" if result.semantic_match else "âœ—"
                     print(f"  {status} Similarity: {result.similarity_score:.3f} | "
                           f"Contains: {result.contains_expected} | "
                           f"Time: {result.retrieval_time_ms:.1f}ms")
                 
             except Exception as e:
                 if verbose:
-                    print(f"  ✗ Error: {e}")
+                    print(f"  âœ— Error: {e}")
                 # Create failed result
                 results.append(EvaluationResult(
                     question=qa['question'],
@@ -341,11 +402,11 @@ class RAGEvaluator:
         
         # Pass/Fail
         if summary.pass_rate >= 0.8:
-            print("✓ PASS (≥80% semantic matches)")
+            print("âœ“ PASS (â‰¥80% semantic matches)")
         elif summary.pass_rate >= 0.6:
-            print("⚠ MARGINAL (60-80% semantic matches)")
+            print("âš  MARGINAL (60-80% semantic matches)")
         else:
-            print("✗ FAIL (<60% semantic matches)")
+            print("âœ— FAIL (<60% semantic matches)")
         print(f"{'='*60}\n")
     
     def save_results(
@@ -540,7 +601,7 @@ class RAGEvaluator:
         
         for i, result in enumerate(summary.results, 1):
             status_class = 'pass' if result.semantic_match else 'fail'
-            status_icon = '✓' if result.semantic_match else '✗'
+            status_icon = 'âœ“' if result.semantic_match else 'âœ—'
             
             html += f"""
         <div class="result {status_class}">
@@ -573,7 +634,7 @@ class RAGEvaluator:
 
 
 def main():
-    """Example usage"""
+    """Example usage with better error handling"""
     
     # Configuration
     config = {
@@ -584,15 +645,112 @@ def main():
         'database': os.getenv('SINGLESTORE_DATABASE', 'rag_db')
     }
     
+    # Get YAML file path
+    yaml_path = "evaluation_questions.yml"
+    
+    # Check if evaluation file exists
+    if not Path(yaml_path).exists():
+        print(f"\nCreating example evaluation file: {yaml_path}")
+        
+        example_questions = [
+            {
+                "question": "What is the name of Singapore's tax authority?",
+                "expectedResponse": "Inland Revenue Authority of Singapore"
+            },
+            {
+                "question": "What is the IRAS website for Transfer Pricing?",
+                "expectedResponse": "https://www.iras.gov.sg/taxes/corporate-income-tax/specific-topics/transfer-pricing"
+            },
+            {
+                "question": "What does MLI stand for?",
+                "expectedResponse": "Multilateral Instrument"
+            }
+        ]
+        
+        with open(yaml_path, 'w', encoding='utf-8') as f:
+            yaml.dump(example_questions, f, default_flow_style=False, allow_unicode=True)
+        
+        print(f"[OK] Created example file: {yaml_path}")
+        print("\nExample format:")
+        print("- question: \"What is X?\"")
+        print("  expectedResponse: \"Y\"")
+        print("- question: \"Another question?\"")
+        print("  expectedResponse: \"Another answer\"")
+        print("\nNext steps:")
+        print("1. Add your documents to the RAG system first")
+        print("2. Update the questions in evaluation_questions.yml")
+        print("3. Run this script again to evaluate")
+        print("\nTo add documents, use:")
+        print("  python example_usage.py")
+        print("  # Or use your ingestion script")
+        return
+    
+    print(f"\nLoading evaluation questions from: {yaml_path}")
+    
+    # Validate questions file
+    try:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+        
+        if not data:
+            print("âœ— Error: Evaluation file is empty")
+            print(f"\nPlease add questions to {yaml_path}")
+            print("\nExample format:")
+            print("- question: \"What is X?\"")
+            print("  expectedResponse: \"Y\"")
+            return
+        
+        # Quick validation
+        if isinstance(data, list):
+            if len(data) == 0:
+                print("âœ— Error: No questions in file")
+                return
+            
+            # Check first item
+            first = data[0]
+            if not isinstance(first, dict):
+                print("âœ— Error: Invalid format. Each item should be a dict.")
+                return
+            
+            if 'question' not in first and 'q' not in first:
+                print("âœ— Error: Missing 'question' field")
+                print(f"   Found keys: {list(first.keys())}")
+                return
+            
+            if 'expectedResponse' not in first and 'answer' not in first and 'expected_response' not in first:
+                print("âœ— Error: Missing 'expectedResponse' field")
+                print(f"   Found keys: {list(first.keys())}")
+                print("\nExpected format:")
+                print("- question: \"What is X?\"")
+                print("  expectedResponse: \"Y\"")
+                return
+        
+    except yaml.YAMLError as e:
+        print(f"âœ— Error: Invalid YAML syntax: {e}")
+        return
+    except Exception as e:
+        print(f"âœ— Error reading file: {e}")
+        return
+    
     # Create pipeline
-    print("Initializing RAG pipeline...")
-    pipeline = create_production_pipeline(
-        config,
-        use_reranker=True,
-        use_hybrid=True
-    )
+    print("\nInitializing RAG pipeline...")
+    try:
+        pipeline = create_production_pipeline(
+            config,
+            use_reranker=True,
+            use_hybrid=True
+        )
+    except Exception as e:
+        print(f"âœ— Error initializing pipeline: {e}")
+        print("\nTroubleshooting:")
+        print("1. Make sure SingleStore is running")
+        print("2. Check database exists: CREATE DATABASE rag_db;")
+        print("3. Verify environment variables are set")
+        print("4. Ensure documents have been ingested")
+        return
     
     # Create evaluator
+    print("Creating evaluator...")
     evaluator = RAGEvaluator(
         pipeline,
         semantic_threshold=0.7,
@@ -600,47 +758,55 @@ def main():
     )
     
     # Run evaluation
-    yaml_path = "evaluation_questions.yml"
-    
-    if not Path(yaml_path).exists():
-        print(f"Creating example evaluation file: {yaml_path}")
-        example_questions = [
-            {
-                "question": "What is the name of Singapore's tax authority?",
-                "expectedResponse": "Inland Revenue Authority of Singapore"
-            },
-            {
-                "question": "What is the tax authority's website for Transfer Pricing information?",
-                "expectedResponse": "https://www.iras.gov.sg/taxes/corporate-income-tax/specific-topics/transfer-pricing"
-            }
-        ]
-        
-        with open(yaml_path, 'w') as f:
-            yaml.dump(example_questions, f, default_flow_style=False)
-        
-        print(f"Example file created. Please add your documents and update {yaml_path}")
+    print("\nRunning evaluation...\n")
+    try:
+        summary = evaluator.evaluate_all(
+            yaml_path,
+            top_k=5,
+            retrieval_k=20,
+            verbose=True
+        )
+    except ValueError as e:
+        print(f"\nâœ— Evaluation failed: {e}")
+        return
+    except Exception as e:
+        print(f"\nâœ— Unexpected error during evaluation: {e}")
+        import traceback
+        traceback.print_exc()
         return
     
-    # Run evaluation
-    summary = evaluator.evaluate_all(
-        yaml_path,
-        top_k=5,
-        retrieval_k=20,
-        verbose=True
-    )
-    
     # Save results
-    evaluator.save_results(
-        summary,
-        'evaluation_results.json',
-        format='json'
-    )
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
-    # Generate HTML report
-    evaluator.generate_report(
-        summary,
-        'evaluation_report.html'
-    )
+    json_path = f'evaluation_results_{timestamp}.json'
+    evaluator.save_results(summary, json_path, format='json')
+    
+    html_path = f'evaluation_report_{timestamp}.html'
+    evaluator.generate_report(summary, html_path)
+    
+    print(f"\n{'='*60}")
+    print("[SUCCESS] Evaluation Complete!")
+    print(f"{'='*60}")
+    print(f"\nResults saved to:")
+    print(f"  - JSON: {json_path}")
+    print(f"  - HTML: {html_path}")
+    print(f"\nOpen {html_path} in your browser to view the detailed report.")
+    
+    # Print actionable insights
+    if summary.pass_rate < 0.6:
+        print(f"\nâš  Low pass rate ({summary.pass_rate*100:.1f}%). Consider:")
+        print("  1. Checking if documents are properly ingested")
+        print("  2. Reviewing if questions match document content")
+        print("  3. Adjusting chunk_size or retrieval parameters")
+        print("  4. Lowering semantic_threshold (currently 0.7)")
+    elif summary.pass_rate < 0.8:
+        print(f"\nâ„¹ï¸  Moderate pass rate ({summary.pass_rate*100:.1f}%). Room for improvement:")
+        print("  1. Consider enabling reranking if not already enabled")
+        print("  2. Try hybrid search for better recall")
+        print("  3. Review failed questions for patterns")
+    else:
+        print(f"\n[SUCCESS] Great pass rate ({summary.pass_rate*100:.1f}%)! Your RAG system is performing well.")
+
 
 
 if __name__ == "__main__":
