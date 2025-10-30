@@ -11,10 +11,14 @@ import json
 from pathlib import Path
 import time
 from datetime import datetime
+import logging
 
 # Import RAG components
 from rag_pipeline import BGEEmbedder, SingleStoreVectorDB
 from advanced_rag import create_production_pipeline
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -335,14 +339,14 @@ class RAGEvaluator:
                 results.append(result)
                 
                 if verbose:
-                    status = "âœ“" if result.semantic_match else "âœ—"
+                    status = "[PASS]" if result.semantic_match else "[FAIL]"
                     print(f"  {status} Similarity: {result.similarity_score:.3f} | "
                           f"Contains: {result.contains_expected} | "
                           f"Time: {result.retrieval_time_ms:.1f}ms")
                 
             except Exception as e:
                 if verbose:
-                    print(f"  âœ— Error: {e}")
+                    print(f"  [ERROR] Error: {e}")
                 # Create failed result
                 results.append(EvaluationResult(
                     question=qa['question'],
@@ -402,11 +406,11 @@ class RAGEvaluator:
         
         # Pass/Fail
         if summary.pass_rate >= 0.8:
-            print("âœ“ PASS (â‰¥80% semantic matches)")
+            print("[PASS] Pass rate >= 80% (semantic matches)")
         elif summary.pass_rate >= 0.6:
-            print("âš  MARGINAL (60-80% semantic matches)")
+            print("[MARGINAL] Pass rate 60-80% (semantic matches)")
         else:
-            print("âœ— FAIL (<60% semantic matches)")
+            print("[FAIL] Pass rate < 60% (semantic matches)")
         print(f"{'='*60}\n")
     
     def save_results(
@@ -601,7 +605,7 @@ class RAGEvaluator:
         
         for i, result in enumerate(summary.results, 1):
             status_class = 'pass' if result.semantic_match else 'fail'
-            status_icon = 'âœ“' if result.semantic_match else 'âœ—'
+            status_icon = '[PASS]' if result.semantic_match else '[FAIL]'
             
             html += f"""
         <div class="result {status_class}">
@@ -693,7 +697,7 @@ def main():
             data = yaml.safe_load(f)
         
         if not data:
-            print("âœ— Error: Evaluation file is empty")
+            print("[ERROR] Evaluation file is empty")
             print(f"\nPlease add questions to {yaml_path}")
             print("\nExample format:")
             print("- question: \"What is X?\"")
@@ -703,22 +707,22 @@ def main():
         # Quick validation
         if isinstance(data, list):
             if len(data) == 0:
-                print("âœ— Error: No questions in file")
+                print("[ERROR] No questions in file")
                 return
             
             # Check first item
             first = data[0]
             if not isinstance(first, dict):
-                print("âœ— Error: Invalid format. Each item should be a dict.")
+                print("[ERROR] Invalid format. Each item should be a dict.")
                 return
             
             if 'question' not in first and 'q' not in first:
-                print("âœ— Error: Missing 'question' field")
+                print("[ERROR] Missing 'question' field")
                 print(f"   Found keys: {list(first.keys())}")
                 return
             
             if 'expectedResponse' not in first and 'answer' not in first and 'expected_response' not in first:
-                print("âœ— Error: Missing 'expectedResponse' field")
+                print("[ERROR] Missing 'expectedResponse' field")
                 print(f"   Found keys: {list(first.keys())}")
                 print("\nExpected format:")
                 print("- question: \"What is X?\"")
@@ -726,10 +730,10 @@ def main():
                 return
         
     except yaml.YAMLError as e:
-        print(f"âœ— Error: Invalid YAML syntax: {e}")
+        print(f"[ERROR] Invalid YAML syntax: {e}")
         return
     except Exception as e:
-        print(f"âœ— Error reading file: {e}")
+        print(f"[ERROR] Error reading file: {e}")
         return
     
     # Create pipeline
@@ -741,7 +745,7 @@ def main():
             use_hybrid=True
         )
     except Exception as e:
-        print(f"âœ— Error initializing pipeline: {e}")
+        print(f"[ERROR] Error initializing pipeline: {e}")
         print("\nTroubleshooting:")
         print("1. Make sure SingleStore is running")
         print("2. Check database exists: CREATE DATABASE rag_db;")
@@ -767,10 +771,10 @@ def main():
             verbose=True
         )
     except ValueError as e:
-        print(f"\nâœ— Evaluation failed: {e}")
+        print(f"\n[ERROR] Evaluation failed: {e}")
         return
     except Exception as e:
-        print(f"\nâœ— Unexpected error during evaluation: {e}")
+        print(f"\n[ERROR] Unexpected error during evaluation: {e}")
         import traceback
         traceback.print_exc()
         return
@@ -794,13 +798,13 @@ def main():
     
     # Print actionable insights
     if summary.pass_rate < 0.6:
-        print(f"\nâš  Low pass rate ({summary.pass_rate*100:.1f}%). Consider:")
+        print(f"\n[WARNING] Low pass rate ({summary.pass_rate*100:.1f}%). Consider:")
         print("  1. Checking if documents are properly ingested")
         print("  2. Reviewing if questions match document content")
         print("  3. Adjusting chunk_size or retrieval parameters")
         print("  4. Lowering semantic_threshold (currently 0.7)")
     elif summary.pass_rate < 0.8:
-        print(f"\nâ„¹ï¸  Moderate pass rate ({summary.pass_rate*100:.1f}%). Room for improvement:")
+        print(f"\n[INFO] Moderate pass rate ({summary.pass_rate*100:.1f}%). Room for improvement:")
         print("  1. Consider enabling reranking if not already enabled")
         print("  2. Try hybrid search for better recall")
         print("  3. Review failed questions for patterns")
